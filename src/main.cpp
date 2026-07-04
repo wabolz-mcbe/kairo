@@ -136,7 +136,18 @@ void EnsureImGuiInitialized(EGLDisplay dpy, EGLSurface surface) {
 
 } // namespace
 
-extern "C" EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+extern "C" __attribute__((visibility("default")))
+EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
+    static long callCount = 0;
+    callCount++;
+    if (callCount == 1) {
+        Log("eglSwapBuffers hook reached for the first time.");
+    } else if (callCount % 300 == 0) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "eglSwapBuffers hook still active (call #%ld).", callCount);
+        Log(msg);
+    }
+
     if (!g_realSwapBuffers) {
         g_realSwapBuffers = (SwapBuffersFn)dlsym(RTLD_NEXT, "eglSwapBuffers");
         if (!g_realSwapBuffers) {
@@ -183,5 +194,23 @@ extern "C" EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
 __attribute__((constructor))
 static void kairo_on_load() {
     Log("Kairo mod loaded.");
+
+    // If mcpelauncher loaded us with RTLD_LOCAL, our exported symbols
+    // (like eglSwapBuffers) would be invisible to other already-loaded
+    // modules' symbol lookups, silently breaking interposition. Re-opening
+    // ourselves with RTLD_GLOBAL | RTLD_NOLOAD promotes us into the
+    // process-wide global scope without loading a second copy.
+    Dl_info info;
+    if (dladdr((void*)&kairo_on_load, &info) && info.dli_fname) {
+        void* h = dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+        if (h) {
+            Log("Promoted Kairo to RTLD_GLOBAL scope.");
+        } else {
+            Log("Could not promote to RTLD_GLOBAL (dlopen/NOLOAD failed).");
+        }
+    } else {
+        Log("dladdr could not determine our own module path.");
+    }
+
     std::thread(StartInputWatcherThreads).detach();
 }
