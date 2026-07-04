@@ -140,11 +140,6 @@ void scan_tile_entities() {
     
     if (memory_ranges.empty()) return;
     
-    // Pattern: tile entity data typically contains:
-    // - A pointer to a string (type identifier)
-    // - Coordinates as floats or doubles
-    // - Some padding/metadata
-    
     for (auto& range : memory_ranges) {
         if (range.second - range.first > 100 * 1024 * 1024) {
             // Skip huge ranges to avoid scanning forever
@@ -153,11 +148,9 @@ void scan_tile_entities() {
         
         for (uintptr_t addr = range.first; addr < range.second - 64; addr += 4) {
             try {
-                // Look for patterns of float triples that look like coordinates
                 float* ptr = (float*)addr;
                 
                 // Check if this could be a coordinate triple
-                // Valid Minecraft coordinates: x,z in ±30000, y in 0-256
                 if (ptr[0] > -30000.0f && ptr[0] < 30000.0f &&
                     ptr[1] > -256.0f && ptr[1] < 512.0f &&
                     ptr[2] > -30000.0f && ptr[2] < 30000.0f) {
@@ -167,7 +160,6 @@ void scan_tile_entities() {
                         uintptr_t* ptr_addr = (uintptr_t*)(addr + offset);
                         uintptr_t potential_string = *ptr_addr;
                         
-                        // Validate pointer is in reasonable range
                         if (potential_string < range.first || potential_string > range.second + 1000000) {
                             continue;
                         }
@@ -175,17 +167,14 @@ void scan_tile_entities() {
                         try {
                             const char* str = (const char*)potential_string;
                             
-                            // Check if this string matches our known tile entity types
                             for (int i = 0; tile_entity_strings[i]; i++) {
                                 if (strstr(str, tile_entity_strings[i])) {
-                                    // Found a match!
                                     StorageBlock block;
                                     block.x = ptr[0];
                                     block.y = ptr[1];
                                     block.z = ptr[2];
                                     block.type = get_type_name(str);
                                     
-                                    // Avoid duplicates (check if similar block already exists)
                                     bool is_duplicate = false;
                                     for (auto& existing : detected_storage_blocks) {
                                         float dx = existing.x - block.x;
@@ -213,7 +202,6 @@ void scan_tile_entities() {
                 
                 next_check:
                 if (detected_storage_blocks.size() > 100) {
-                    // Limit to 100 blocks to avoid performance issues
                     goto done_scanning;
                 }
                 
@@ -227,37 +215,51 @@ void scan_tile_entities() {
     scan_count++;
 }
 
-void draw_box_3d(float x, float y, float z, float size, float r, float g, float b, float thickness) {
-    float vertices[8][3] = {
-        {x - size, y - size, z - size},
-        {x + size, y - size, z - size},
-        {x + size, y + size, z - size},
-        {x - size, y + size, z - size},
-        {x - size, y - size, z + size},
-        {x + size, y - size, z + size},
-        {x + size, y + size, z + size},
-        {x - size, y + size, z + size},
+// Simulated World-To-Screen projection framework
+// Note: Real implementations read the target engine's active ViewProjection Matrix.
+bool world_to_screen(float wx, float wy, float wz, ImVec2& out_screen) {
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    float screen_width = (float)viewport[2];
+    float screen_height = (float)viewport[3];
+
+    if (screen_width <= 0 || screen_height <= 0) return false;
+
+    // Fallback Mock Projection: Projects onto flat screen center coordinates.
+    // Replace this logic with your targeted matrix calculations as your binary hooking expands.
+    out_screen.x = screen_width * 0.5f + (wx * 10.0f); 
+    out_screen.y = screen_height * 0.5f - (wy * 10.0f);
+    return true;
+}
+
+// OpenGL ES 2.0 Compliant Box Rendering utilizing ImGui draw layers
+void draw_box_3d_imgui(float x, float y, float z, float size, float r, float g, float b, float thickness) {
+    float vertices_3d[8][3] = {
+        {x - size, y - size, z - size}, {x + size, y - size, z - size},
+        {x + size, y + size, z - size}, {x - size, y + size, z - size},
+        {x - size, y - size, z + size}, {x + size, y - size, z + size},
+        {x + size, y + size, z + size}, {x - size, y + size, z + size}
     };
+    
+    ImVec2 screen_points[8];
+    for (int i = 0; i < 8; i++) {
+        if (!world_to_screen(vertices_3d[i][0], vertices_3d[i][1], vertices_3d[i][2], screen_points[i])) {
+            return; // Invalidation safe-check
+        }
+    }
     
     int edges[12][2] = {
-        {0, 1}, {1, 2}, {2, 3}, {3, 0},
-        {4, 5}, {5, 6}, {6, 7}, {7, 4},
-        {0, 4}, {1, 5}, {2, 6}, {3, 7}
+        {0, 1}, {1, 2}, {2, 3}, {3, 0}, // Back
+        {4, 5}, {5, 6}, {6, 7}, {7, 4}, // Front
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Edges
     };
     
-    glLineWidth(thickness);
-    glColor4f(r, g, b, 0.8f);
+    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
+    ImU32 color = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 0.8f));
     
-    glBegin(GL_LINES);
     for (int i = 0; i < 12; i++) {
-        float* v1 = vertices[edges[i][0]];
-        float* v2 = vertices[edges[i][1]];
-        glVertex3f(v1[0], v1[1], v1[2]);
-        glVertex3f(v2[0], v2[1], v2[2]);
+        draw_list->AddLine(screen_points[edges[i][0]], screen_points[edges[i][1]], color, thickness);
     }
-    glEnd();
-    
-    glLineWidth(1.0f);
 }
 
 void kairo_init() {
@@ -368,18 +370,12 @@ void kairo_gui() {
 void render_esp_boxes() {
     if (!storage_esp_enabled || detected_storage_blocks.empty()) return;
     
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDisable(GL_DEPTH_TEST);
-    
+    // Pass rendering properties directly to our safe ImGui coordinate conversion layer
     for (auto& block : detected_storage_blocks) {
-        draw_box_3d(block.x, block.y, block.z, 0.5f, 
+        draw_box_3d_imgui(block.x, block.y, block.z, 0.5f, 
                    esp_outline_color[0], esp_outline_color[1], esp_outline_color[2],
                    esp_outline_thickness);
     }
-    
-    glEnable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
 }
 
 EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
@@ -392,15 +388,17 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
         o_key_was_pressed = false;
     }
     
-    // Scan every other frame to avoid performance impact
     static int frame = 0;
     if (++frame % 2 == 0) {
         scan_tile_entities();
     }
-    render_esp_boxes();
     
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
+    
+    // Draw the overlay metrics using current frame calculations safely through ImGui
+    render_esp_boxes();
+    
     kairo_gui();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
