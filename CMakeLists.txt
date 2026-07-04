@@ -30,11 +30,12 @@ target_include_directories(kairo PRIVATE
     ${IMGUI_DIR}/backends
 )
 
-# Link libraries
+# Link libraries (removed pthread - built into Android libc)
 target_link_libraries(kairo
     GLESv2
     EGL
-    pthread
+    atomic
+    m
 )
 
 # Set output directory
