@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Some Android NDK toolchain defaults hide exported symbols, which would
+# silently break eglSwapBuffers interposition. Force default visibility.
+set(CMAKE_CXX_VISIBILITY_PRESET default)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+
 # imgui/ is cloned into the repo root by the CI workflow before this runs.
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/imgui)
 
