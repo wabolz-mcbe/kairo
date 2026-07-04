@@ -9,48 +9,27 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <unistd.h>
+#include <thread>
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 
-// SDL2 minimal structures for compilation without adding heavy dependency headers
-typedef uint32_t Uint32;
-typedef int32_t Sint32;
+// X11 dynamic function mapping definitions
+typedef void* (*XOpenDisplay_t)(const char*);
+typedef int (*XQueryKeymap_t)(void*, char*);
+typedef int (*XCloseDisplay_t)(void*);
 
-struct SDL_KeyboardEvent {
-    Uint32 type;
-    Uint32 timestamp;
-    Uint32 windowID;
-    uint8_t state;
-    uint8_t repeat;
-    uint8_t padding2;
-    uint8_t padding3;
-    Sint32 scancode; // SDL_Scancode
-    Sint32 sym;      // SDL_Keycode
-    uint16_t mod;
-    Uint32 unused;
-};
-
-union SDL_Event {
-    Uint32 type;
-    uint8_t padding[56];
-    SDL_KeyboardEvent key;
-};
-
-// SDL2 Constants
-#define SDL_KEYDOWN 0x300
-#define SDLK_o 'o'
-
-// Function typdefs for hooking
-typedef int (*SDL_PollEvent_t)(SDL_Event* event);
-static SDL_PollEvent_t original_SDL_PollEvent = nullptr;
-
-typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay display, EGLSurface surface);
-static eglSwapBuffers_t original_eglSwapBuffers = nullptr;
+static XOpenDisplay_t p_XOpenDisplay = nullptr;
+static XQueryKeymap_t p_XQueryKeymap = nullptr;
+static XCloseDisplay_t p_XCloseDisplay = nullptr;
+static void* x11_lib = nullptr;
 
 // Global state
-static std::atomic<bool> kairo_visible(true); // Starts visible so you can confirm it loads immediately
+static std::atomic<bool> kairo_visible(true); // Default to TRUE so it shows right away!
 static bool kairo_initialized = false;
+typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay display, EGLSurface surface);
+static eglSwapBuffers_t original_eglSwapBuffers = nullptr;
 
 // Module states
 static bool storage_esp_enabled = false;
@@ -81,16 +60,53 @@ static std::vector<Module> modules = {
 
 static bool show_settings[2] = {false, false};
 
+// X11 Global input checker loop thread
+void x11_input_thread() {
+    // Try to load X11 from standard Linux runtime paths
+    x11_lib = dlopen("libX11.so.6", RTLD_LAZY);
+    if (!x11_lib) x11_lib = dlopen("libX11.so", RTLD_LAZY);
+    if (!x11_lib) return; // Silent fallback if not on Linux desktop
+
+    p_XOpenDisplay = (XOpenDisplay_t)dlsym(x11_lib, "XOpenDisplay");
+    p_XQueryKeymap = (XQueryKeymap_t)dlsym(x11_lib, "XQueryKeymap");
+    p_XCloseDisplay = (XCloseDisplay_t)dlsym(x11_lib, "XCloseDisplay");
+
+    if (!p_XOpenDisplay || !p_XQueryKeymap || !p_XCloseDisplay) {
+        dlclose(x11_lib);
+        return;
+    }
+
+    void* display = p_XOpenDisplay(nullptr);
+    if (!display) return;
+
+    char keys_return[32];
+    bool o_was_pressed = false;
+    
+    // Keycode for 'O' on standard Linux X11 systems is usually 32
+    const int X11_KEYCODE_O = 32; 
+
+    while (true) {
+        p_XQueryKeymap(display, keys_return);
+        
+        // Check byte map state of the key code
+        bool o_is_pressed = (keys_return[X11_KEYCODE_O / 8] & (1 << (X11_KEYCODE_O % 8))) != 0;
+
+        if (o_is_pressed && !o_was_pressed) {
+            kairo_visible = !kairo_visible; // Toggle visibility bypass
+        }
+        o_was_pressed = o_is_pressed;
+
+        usleep(10000); // Poll every 10ms to keep CPU usage at 0%
+    }
+
+    p_XCloseDisplay(display);
+    dlclose(x11_lib);
+}
+
 const char* tile_entity_strings[] = {
-    "minecraft:chest",
-    "minecraft:shulker_box",
-    "minecraft:trapped_chest",
-    "minecraft:ender_chest",
-    "minecraft:furnace",
-    "minecraft:blast_furnace",
-    "minecraft:barrel",
-    "minecraft:copper_chest",
-    nullptr
+    "minecraft:chest", "minecraft:shulker_box", "minecraft:trapped_chest",
+    "minecraft:ender_chest", "minecraft:furnace", "minecraft:blast_furnace",
+    "minecraft:barrel", "minecraft:copper_chest", nullptr
 };
 
 const char* get_type_name(const char* str) {
@@ -116,7 +132,6 @@ void scan_tile_entities() {
     }
     
     detected_storage_blocks.clear();
-    
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps) return;
     
@@ -125,10 +140,8 @@ void scan_tile_entities() {
     
     while (fgets(line, sizeof(line), maps)) {
         uintptr_t start, end;
-        char perm[5], path[256];
-        path[0] = 0;
-        
-        if (sscanf(line, "%lx-%lx %s %*s %*s %*s %s", &start, &end, perm, path) >= 3) {
+        char perm[5];
+        if (sscanf(line, "%lx-%lx %s", &start, &end, perm) >= 3) {
             if (perm[0] == 'r' && (perm[1] == 'w' || perm[2] == 'x')) {
                 memory_ranges.push_back({start, end});
             }
@@ -136,11 +149,8 @@ void scan_tile_entities() {
     }
     fclose(maps);
     
-    if (memory_ranges.empty()) return;
-    
     for (auto& range : memory_ranges) {
         if (range.second - range.first > 100 * 1024 * 1024) continue;
-        
         for (uintptr_t addr = range.first; addr < range.second - 64; addr += 4) {
             try {
                 float* ptr = (float*)addr;
@@ -149,42 +159,30 @@ void scan_tile_entities() {
                     ptr[2] > -30000.0f && ptr[2] < 30000.0f) {
                     
                     for (int offset = -256; offset <= 0; offset += 8) {
-                        uintptr_t* ptr_addr = (uintptr_t*)(addr + offset);
-                        uintptr_t potential_string = *ptr_addr;
-                        
+                        uintptr_t potential_string = *(uintptr_t*)(addr + offset);
                         if (potential_string < range.first || potential_string > range.second + 1000000) continue;
                         
                         try {
                             const char* str = (const char*)potential_string;
                             for (int i = 0; tile_entity_strings[i]; i++) {
                                 if (strstr(str, tile_entity_strings[i])) {
-                                    StorageBlock block;
-                                    block.x = ptr[0];
-                                    block.y = ptr[1];
-                                    block.z = ptr[2];
-                                    block.type = get_type_name(str);
-                                    
+                                    StorageBlock block = {ptr[0], ptr[1], ptr[2], get_type_name(str)};
                                     bool is_duplicate = false;
                                     for (auto& existing : detected_storage_blocks) {
-                                        float dx = existing.x - block.x;
-                                        float dy = existing.y - block.y;
-                                        float dz = existing.z - block.z;
-                                        if (std::sqrt(dx*dx + dy*dy + dz*dz) < 0.5f) {
-                                            is_duplicate = true;
-                                            break;
+                                        if (std::sqrt(std::pow(existing.x-block.x,2)+std::pow(existing.y-block.y,2)+std::pow(existing.z-block.z,2)) < 0.5f) {
+                                            is_duplicate = true; break;
                                         }
                                     }
-                                    
                                     if (!is_duplicate) detected_storage_blocks.push_back(block);
                                     goto next_check;
                                 }
                             }
-                        } catch (...) { continue; }
+                        } catch (...) {}
                     }
                 }
                 next_check:
                 if (detected_storage_blocks.size() > 100) goto done_scanning;
-            } catch (...) { continue; }
+            } catch (...) {}
         }
     }
     done_scanning:
@@ -192,95 +190,47 @@ void scan_tile_entities() {
 }
 
 bool world_to_screen(float wx, float wy, float wz, ImVec2& out_screen) {
-    GLint viewport[4];
-    glGetIntegerv(GL_VIEWPORT, viewport);
-    float screen_width = (float)viewport[2];
-    float screen_height = (float)viewport[3];
-
-    if (screen_width <= 0 || screen_height <= 0) return false;
-
-    out_screen.x = screen_width * 0.5f + (wx * 10.0f); 
-    out_screen.y = screen_height * 0.5f - (wy * 10.0f);
+    GLint viewport[4]; glGetIntegerv(GL_VIEWPORT, viewport);
+    float sw = (float)viewport[2], sh = (float)viewport[3];
+    if (sw <= 0 || sh <= 0) return false;
+    out_screen.x = sw * 0.5f + (wx * 10.0f); 
+    out_screen.y = sh * 0.5f - (wy * 10.0f);
     return true;
 }
 
 void draw_box_3d_imgui(float x, float y, float z, float size, float r, float g, float b, float thickness) {
-    float vertices_3d[8][3] = {
-        {x - size, y - size, z - size}, {x + size, y - size, z - size},
-        {x + size, y + size, z - size}, {x - size, y + size, z - size},
-        {x - size, y - size, z + size}, {x + size, y - size, z + size},
-        {x + size, y + size, z + size}, {x - size, y + size, z + size}
+    float v[8][3] = {
+        {x-size, y-size, z-size}, {x+size, y-size, z-size}, {x+size, y+size, z-size}, {x-size, y+size, z-size},
+        {x-size, y-size, z+size}, {x+size, y-size, z+size}, {x+size, y+size, z+size}, {x-size, y+size, z+size}
     };
-    
-    ImVec2 screen_points[8];
-    for (int i = 0; i < 8; i++) {
-        if (!world_to_screen(vertices_3d[i][0], vertices_3d[i][1], vertices_3d[i][2], screen_points[i])) return;
-    }
-    
-    int edges[12][2] = {
-        {0, 1}, {1, 2}, {2, 3}, {3, 0},
-        {4, 5}, {5, 6}, {6, 7}, {7, 4},
-        {0, 4}, {1, 5}, {2, 6}, {3, 7}
-    };
-    
-    ImDrawList* draw_list = ImGui::GetForegroundDrawList();
-    ImU32 color = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 0.8f));
-    
-    for (int i = 0; i < 12; i++) {
-        draw_list->AddLine(screen_points[edges[i][0]], screen_points[edges[i][1]], color, thickness);
-    }
+    ImVec2 s[8];
+    for (int i = 0; i < 8; i++) if (!world_to_screen(v[i][0], v[i][1], v[i][2], s[i])) return;
+    int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, 0.8f));
+    for (int i = 0; i < 12; i++) dl->AddLine(s[edges[i][0]], s[edges[i][1]], col, thickness);
 }
 
 void kairo_init() {
     if (kairo_initialized) return;
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-    
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.05f, 0.05f, 0.08f, 0.95f);
-    style.Colors[ImGuiCol_Header] = ImVec4(0.15f, 0.4f, 0.7f, 0.9f);
-    style.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.2f, 0.5f, 0.8f, 1.0f);
-    style.Colors[ImGuiCol_Button] = ImVec4(0.1f, 0.3f, 0.6f, 0.8f);
-    style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.15f, 0.4f, 0.7f, 1.0f);
-    style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.0f, 0.6f, 1.0f, 1.0f);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.08f, 0.08f, 0.1f, 0.8f);
-    style.Colors[ImGuiCol_Text] = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
-    style.WindowPadding = ImVec2(8, 8);
-    style.FramePadding = ImVec2(6, 4);
-    style.ItemSpacing = ImVec2(6, 6);
-
     ImGui_ImplOpenGL3_Init("#version 100");
     kairo_initialized = true;
+
+    // Fire off the background X11 system-wide global key reader thread
+    std::thread(x11_input_thread).detach();
 }
 
 void render_module_item(int idx) {
-    Module& mod = modules[idx];
-    ImGui::PushID(idx);
-    
-    float avail_width = ImGui::GetContentRegionAvail().x;
-    ImVec2 button_size(avail_width, 30);
-    
+    Module& mod = modules[idx]; ImGui::PushID(idx);
     std::string label = std::string(*mod.enabled ? "[ON]  " : "[OFF] ") + mod.name;
-    
-    if (ImGui::Button(label.c_str(), button_size)) {
-        *mod.enabled = !(*mod.enabled);
-    }
-    
-    if (ImGui::IsItemClicked(1)) {
-        show_settings[idx] = !show_settings[idx];
-    }
-    
+    if (ImGui::Button(label.c_str(), ImVec2(ImGui::GetContentRegionAvail().x, 30))) *mod.enabled = !(*mod.enabled);
+    if (ImGui::IsItemClicked(1)) show_settings[idx] = !show_settings[idx];
     if (show_settings[idx] && mod.has_settings) {
-        ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y));
-        ImGui::SetNextWindowSize(ImVec2(220, 140));
-        ImGui::Begin(("##settings" + mod.name).c_str(), nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
-        if (idx == 0) {
-            ImGui::Text("Outline Color");
-            ImGui::ColorEdit3("##color", esp_outline_color);
-            ImGui::SliderFloat("Thickness", &esp_outline_thickness, 0.5f, 5.0f);
-        }
+        ImGui::Begin(("##set" + mod.name).c_str(), nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
+        if (idx == 0) { ImGui::ColorEdit3("Color", esp_outline_color); ImGui::SliderFloat("Size", &esp_outline_thickness, 0.5f, 5.0f); }
         ImGui::End();
     }
     ImGui::PopID();
@@ -288,91 +238,35 @@ void render_module_item(int idx) {
 
 void kairo_gui() {
     if (!kairo_visible) return;
-
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(320, 500), ImGuiCond_FirstUseEver);
-
-    if (ImGui::Begin("Kairo - Linux Native", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
-        ImGui::Text("KAIRO MENU");
-        ImGui::Spacing();
-        
-        static char search_buf[128] = "";
-        ImGui::InputTextWithHint("##search", "Search modules...", search_buf, IM_ARRAYSIZE(search_buf));
-        ImGui::Separator();
-        
-        ImGui::Text("Modules:");
-        ImGui::Spacing();
-        
-        for (int i = 0; i < modules.size(); i++) {
-            render_module_item(i);
-            ImGui::Spacing();
-        }
-        
-        ImGui::Separator();
-        
+    ImGui::SetNextWindowSize(ImVec2(320, 450), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Kairo Premium Overlay", nullptr, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+        ImGui::Text("KAIRO LOADER"); ImGui::Separator();
+        for (int i = 0; i < modules.size(); i++) { render_module_item(i); ImGui::Spacing(); }
         if (storage_esp_enabled) {
-            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "Storage blocks: %lu", detected_storage_blocks.size());
-            ImGui::TextDisabled("Scans: %d", (int)scan_count);
-            
-            if (ImGui::BeginChild("BlockList", ImVec2(0, 150), true)) {
-                for (auto& block : detected_storage_blocks) {
-                    ImGui::TextWrapped("%s @ (%.0f, %.0f, %.0f)", block.type.c_str(), block.x, block.y, block.z);
-                }
+            ImGui::Text("Detected Storage: %lu", detected_storage_blocks.size());
+            if (ImGui::BeginChild("Blocks", ImVec2(0, 120), true)) {
+                for (auto& b : detected_storage_blocks) ImGui::Text("%s: (%.0f, %.0f, %.0f)", b.type.c_str(), b.x, b.y, b.z);
                 ImGui::EndChild();
             }
         }
-        
         ImGui::Separator();
-        ImGui::TextDisabled("Press physical 'O' key to hide/show");
+        ImGui::TextDisabled("Press physical 'O' key to hide menu.");
     }
     ImGui::End();
 }
 
-void render_esp_boxes() {
-    if (!storage_esp_enabled || detected_storage_blocks.empty()) return;
-    for (auto& block : detected_storage_blocks) {
-        draw_box_3d_imgui(block.x, block.y, block.z, 0.5f, 
-                   esp_outline_color[0], esp_outline_color[1], esp_outline_color[2],
-                   esp_outline_thickness);
-    }
-}
-
-// HOOKED SDL2 INTERCEPT LAYER
-extern "C" int SDL_PollEvent(SDL_Event* event) {
-    if (!original_SDL_PollEvent) {
-        original_SDL_PollEvent = (SDL_PollEvent_t)dlsym(RTLD_NEXT, "SDL_PollEvent");
-    }
-
-    int result = original_SDL_PollEvent(event);
-
-    // If an event occurs and it matches key down metrics
-    if (result && event) {
-        if (event->type == SDL_KEYDOWN) {
-            if (event->key.sym == SDLK_o && event->key.repeat == 0) {
-                kairo_visible = !kairo_visible;
-            }
-        }
-    }
-    return result;
-}
-
 EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     if (!kairo_initialized) kairo_init();
-    
     static int frame = 0;
-    if (++frame % 2 == 0) {
-        scan_tile_entities();
+    if (++frame % 2 == 0) scan_tile_entities();
+    
+    ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
+    if (storage_esp_enabled) {
+        for (auto& b : detected_storage_blocks) draw_box_3d_imgui(b.x, b.y, b.z, 0.5f, esp_outline_color[0], esp_outline_color[1], esp_outline_color[2], esp_outline_thickness);
     }
-    
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui::NewFrame();
-    
-    render_esp_boxes();
     kairo_gui();
-    
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    
     return original_eglSwapBuffers(display, surface);
 }
 
