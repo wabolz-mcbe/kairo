@@ -3,12 +3,7 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdio>
-#include <thread>
 #include <atomic>
-#include <fcntl.h>
-#include <unistd.h>
-#include <ctime>
-#include <map>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -18,11 +13,44 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 
-// Global state - SET TO TRUE initially so you can see it right away!
-static std::atomic<bool> kairo_visible(true);
-static bool kairo_initialized = false;
+// SDL2 minimal structures for compilation without adding heavy dependency headers
+typedef uint32_t Uint32;
+typedef int32_t Sint32;
+
+struct SDL_KeyboardEvent {
+    Uint32 type;
+    Uint32 timestamp;
+    Uint32 windowID;
+    uint8_t state;
+    uint8_t repeat;
+    uint8_t padding2;
+    uint8_t padding3;
+    Sint32 scancode; // SDL_Scancode
+    Sint32 sym;      // SDL_Keycode
+    uint16_t mod;
+    Uint32 unused;
+};
+
+union SDL_Event {
+    Uint32 type;
+    uint8_t padding[56];
+    SDL_KeyboardEvent key;
+};
+
+// SDL2 Constants
+#define SDL_KEYDOWN 0x300
+#define SDLK_o 'o'
+
+// Function typdefs for hooking
+typedef int (*SDL_PollEvent_t)(SDL_Event* event);
+static SDL_PollEvent_t original_SDL_PollEvent = nullptr;
+
 typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay display, EGLSurface surface);
 static eglSwapBuffers_t original_eglSwapBuffers = nullptr;
+
+// Global state
+static std::atomic<bool> kairo_visible(true); // Starts visible so you can confirm it loads immediately
+static bool kairo_initialized = false;
 
 // Module states
 static bool storage_esp_enabled = false;
@@ -32,7 +60,6 @@ static bool green_text_enabled = false;
 static float esp_outline_color[3] = {0.0f, 1.0f, 0.5f}; // Cyan
 static float esp_outline_thickness = 2.0f;
 
-// Detected storage blocks
 struct StorageBlock {
     float x, y, z;
     std::string type;
@@ -41,7 +68,6 @@ struct StorageBlock {
 static std::vector<StorageBlock> detected_storage_blocks;
 static std::atomic<int> scan_count(0);
 
-// Module structs
 struct Module {
     std::string name;
     bool* enabled;
@@ -55,9 +81,6 @@ static std::vector<Module> modules = {
 
 static bool show_settings[2] = {false, false};
 
-// No thread required anymore! Removing raw /dev/input entirely.
-
-// Known tile entity type strings in the binary
 const char* tile_entity_strings[] = {
     "minecraft:chest",
     "minecraft:shulker_box",
@@ -253,16 +276,13 @@ void render_module_item(int idx) {
         ImGui::SetNextWindowPos(ImVec2(ImGui::GetItemRectMin().x, ImGui::GetItemRectMax().y));
         ImGui::SetNextWindowSize(ImVec2(220, 140));
         ImGui::Begin(("##settings" + mod.name).c_str(), nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
-        
         if (idx == 0) {
             ImGui::Text("Outline Color");
             ImGui::ColorEdit3("##color", esp_outline_color);
             ImGui::SliderFloat("Thickness", &esp_outline_thickness, 0.5f, 5.0f);
         }
-        
         ImGui::End();
     }
-    
     ImGui::PopID();
 }
 
@@ -272,8 +292,8 @@ void kairo_gui() {
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(320, 500), ImGuiCond_FirstUseEver);
 
-    if (ImGui::Begin("Kairo", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
-        ImGui::Text("KAIRO - Menu Active");
+    if (ImGui::Begin("Kairo - Linux Native", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+        ImGui::Text("KAIRO MENU");
         ImGui::Spacing();
         
         static char search_buf[128] = "";
@@ -303,7 +323,7 @@ void kairo_gui() {
         }
         
         ImGui::Separator();
-        ImGui::TextDisabled("Press 'O' key to minimize/hide");
+        ImGui::TextDisabled("Press physical 'O' key to hide/show");
     }
     ImGui::End();
 }
@@ -317,6 +337,25 @@ void render_esp_boxes() {
     }
 }
 
+// HOOKED SDL2 INTERCEPT LAYER
+extern "C" int SDL_PollEvent(SDL_Event* event) {
+    if (!original_SDL_PollEvent) {
+        original_SDL_PollEvent = (SDL_PollEvent_t)dlsym(RTLD_NEXT, "SDL_PollEvent");
+    }
+
+    int result = original_SDL_PollEvent(event);
+
+    // If an event occurs and it matches key down metrics
+    if (result && event) {
+        if (event->type == SDL_KEYDOWN) {
+            if (event->key.sym == SDLK_o && event->key.repeat == 0) {
+                kairo_visible = !kairo_visible;
+            }
+        }
+    }
+    return result;
+}
+
 EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     if (!kairo_initialized) kairo_init();
     
@@ -327,12 +366,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
-    
-    // GUARANTEED INPUT OPTION: Read keypress directly from ImGui's cross-platform IO pipeline
-    // ImGui Key 65 maps to standard keyboard 'O'
-    if (ImGui::IsKeyPressed(ImGuiKey_O)) {
-        kairo_visible = !kairo_visible;
-    }
     
     render_esp_boxes();
     kairo_gui();
