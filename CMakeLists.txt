@@ -3,37 +3,43 @@ project(kairo)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# imgui/ is cloned into the repo root by the CI workflow before this runs.
-set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/imgui)
-
-add_library(kairo SHARED
+# Add main source
+set(SOURCES
     src/main.cpp
-    src/kairo_gui.cpp
-    ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_draw.cpp
-    ${IMGUI_DIR}/imgui_tables.cpp
-    ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+# Dear ImGui sources
+set(IMGUI_DIR imgui)
+set(IMGUI_SOURCES
+    ${IMGUI_DIR}/imgui.cpp
+    ${IMGUI_DIR}/imgui_demo.cpp
+    ${IMGUI_DIR}/imgui_draw.cpp
+    ${IMGUI_DIR}/imgui_widgets.cpp
+    ${IMGUI_DIR}/imgui_tables.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_android.cpp
+)
+
+# Create shared library
+add_library(kairo SHARED ${SOURCES} ${IMGUI_SOURCES})
+
+# Include directories
 target_include_directories(kairo PRIVATE
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
 
-target_compile_definitions(kairo PRIVATE IMGUI_IMPL_OPENGL_ES2)
-
+# Link libraries
 target_link_libraries(kairo
     GLESv2
     EGL
-    log
-    android
-    dl
+    pthread
 )
 
+# Set output directory
 set_target_properties(kairo PROPERTIES
-    OUTPUT_NAME "kairo"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
     PREFIX "lib"
+    SUFFIX ".so"
 )
