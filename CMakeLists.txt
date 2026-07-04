@@ -30,7 +30,10 @@ target_include_directories(kairo PRIVATE
     ${IMGUI_DIR}/backends
 )
 
-# Link libraries (removed pthread - built into Android libc)
+# Add OpenGL ES 2.0 compatibility define
+target_compile_definitions(kairo PRIVATE IMGUI_IMPL_OPENGL_ES2)
+
+# Link libraries
 target_link_libraries(kairo
     GLESv2
     EGL
