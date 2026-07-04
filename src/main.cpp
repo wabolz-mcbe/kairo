@@ -12,7 +12,6 @@
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
-#include "imgui_impl_android.h"
 
 static std::atomic<bool> kairo_visible(false);
 static bool kairo_initialized = false;
@@ -47,7 +46,6 @@ void kairo_init() {
     style.Colors[ImGuiCol_WindowBg] = ImVec4(0.1f, 0.1f, 0.12f, 0.95f);
     style.Colors[ImGuiCol_Header] = ImVec4(0.2f, 0.4f, 0.6f, 0.8f);
     ImGui_ImplOpenGL3_Init("#version 100");
-    ImGui_ImplAndroid_Init();
     kairo_initialized = true;
     input_thread_handle = new std::thread(input_thread_func);
 }
@@ -82,7 +80,6 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
         o_key_was_pressed = false;
     }
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
     kairo_gui();
     ImGui::Render();
