@@ -1,7 +1,7 @@
 name: Build Kairo mod
 
 on:
-  workflow_dispatch:      # lets you click "Run workflow" manually on GitHub
+  workflow_dispatch:
   push:
     branches: [ main ]
 
@@ -11,6 +11,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Clone Dear ImGui
+        run: git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui.git
 
       - name: Download Android NDK
         run: |
@@ -26,7 +29,7 @@ jobs:
                 -B build
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --verbose
 
       - name: Find the built .so
         run: find build -name "*.so"
