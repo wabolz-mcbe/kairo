@@ -61,21 +61,42 @@ static std::vector<Module> modules = {
 static bool show_settings[2] = {false, false};
 
 void input_thread_func() {
-    int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
-    if (fd < 0) return;
+    int fds[8];
+    int max_fd = -1;
     
+    // Open all possible input devices to guarantee capturing external keyboards/OTG
+    for (int i = 0; i < 8; i++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        fds[i] = open(path, O_RDONLY | O_NONBLOCK);
+        if (fds[i] > max_fd) {
+            max_fd = fds[i];
+        }
+    }
+
+    if (max_fd == -1) return; // If permission denies everything, fall back safely
+
     struct input_event ev;
     while (true) {
-        ssize_t n = read(fd, &ev, sizeof(ev));
-        if (n == sizeof(ev)) {
-            if (ev.type == EV_KEY && ev.code == 24) {
-                o_key_pressed = (ev.value != 0);
+        for (int i = 0; i < 8; i++) {
+            if (fds[i] < 0) continue;
+            
+            while (read(fds[i], &ev, sizeof(ev)) == sizeof(ev)) {
+                // EV_KEY check
+                if (ev.type == 1) { 
+                    // 24 = Standard Linux kernel KEY_O
+                    if (ev.code == 24) { 
+                        o_key_pressed = (ev.value != 0);
+                    }
+                }
             }
         }
-        usleep(1000);
+        usleep(1000); // 1ms sleep loop to optimize CPU overhead
     }
-    close(fd);
+
+    for (int i = 0; i < 8; i++) {
+        if (fds[i] >= 0) close(fds[i]);
+    }
 }
 
 // Known tile entity type strings in the binary
