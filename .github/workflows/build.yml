@@ -1,1 +1,38 @@
+name: Build Kairo mod
 
+on:
+  workflow_dispatch:      # lets you click "Run workflow" manually on GitHub
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Download Android NDK
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q android-ndk-r27c-linux.zip
+
+      - name: Configure
+        run: |
+          cmake -DCMAKE_TOOLCHAIN_FILE=$GITHUB_WORKSPACE/android-ndk-r27c/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=arm64-v8a \
+                -DANDROID_PLATFORM=android-24 \
+                -DCMAKE_BUILD_TYPE=Release \
+                -B build
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Find the built .so
+        run: find build -name "*.so"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kairo-mod-arm64
+          path: build/**/*.so
