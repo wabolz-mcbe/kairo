@@ -7,7 +7,6 @@
 #include <atomic>
 #include <fcntl.h>
 #include <unistd.h>
-#include <linux/input.h>
 #include <ctime>
 #include <map>
 #include <string>
@@ -19,15 +18,11 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 
-// Global state
-static std::atomic<bool> kairo_visible(false);
+// Global state - SET TO TRUE initially so you can see it right away!
+static std::atomic<bool> kairo_visible(true);
 static bool kairo_initialized = false;
 typedef EGLBoolean (*eglSwapBuffers_t)(EGLDisplay display, EGLSurface surface);
 static eglSwapBuffers_t original_eglSwapBuffers = nullptr;
-
-// Key state
-static std::atomic<bool> o_key_pressed(false);
-static bool o_key_was_pressed = false;
 
 // Module states
 static bool storage_esp_enabled = false;
@@ -60,44 +55,7 @@ static std::vector<Module> modules = {
 
 static bool show_settings[2] = {false, false};
 
-void input_thread_func() {
-    int fds[8];
-    int max_fd = -1;
-    
-    // Open all possible input devices to guarantee capturing external keyboards/OTG
-    for (int i = 0; i < 8; i++) {
-        char path[32];
-        snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        fds[i] = open(path, O_RDONLY | O_NONBLOCK);
-        if (fds[i] > max_fd) {
-            max_fd = fds[i];
-        }
-    }
-
-    if (max_fd == -1) return; // If permission denies everything, fall back safely
-
-    struct input_event ev;
-    while (true) {
-        for (int i = 0; i < 8; i++) {
-            if (fds[i] < 0) continue;
-            
-            while (read(fds[i], &ev, sizeof(ev)) == sizeof(ev)) {
-                // EV_KEY check
-                if (ev.type == 1) { 
-                    // 24 = Standard Linux kernel KEY_O
-                    if (ev.code == 24) { 
-                        o_key_pressed = (ev.value != 0);
-                    }
-                }
-            }
-        }
-        usleep(1000); // 1ms sleep loop to optimize CPU overhead
-    }
-
-    for (int i = 0; i < 8; i++) {
-        if (fds[i] >= 0) close(fds[i]);
-    }
-}
+// No thread required anymore! Removing raw /dev/input entirely.
 
 // Known tile entity type strings in the binary
 const char* tile_entity_strings[] = {
@@ -112,7 +70,6 @@ const char* tile_entity_strings[] = {
     nullptr
 };
 
-// Map string to display name
 const char* get_type_name(const char* str) {
     if (strstr(str, "chest")) {
         if (strstr(str, "shulker")) return "Shulker";
@@ -129,7 +86,6 @@ const char* get_type_name(const char* str) {
     return "Storage";
 }
 
-// Memory scanner that looks for tile entity patterns
 void scan_tile_entities() {
     if (!storage_esp_enabled) {
         detected_storage_blocks.clear();
@@ -138,7 +94,6 @@ void scan_tile_entities() {
     
     detected_storage_blocks.clear();
     
-    // Get heap memory range
     FILE* maps = fopen("/proc/self/maps", "r");
     if (!maps) return;
     
@@ -151,7 +106,6 @@ void scan_tile_entities() {
         path[0] = 0;
         
         if (sscanf(line, "%lx-%lx %s %*s %*s %*s %s", &start, &end, perm, path) >= 3) {
-            // Scan readable, writable memory (heap, stack, mmap regions where game data lives)
             if (perm[0] == 'r' && (perm[1] == 'w' || perm[2] == 'x')) {
                 memory_ranges.push_back({start, end});
             }
@@ -162,32 +116,23 @@ void scan_tile_entities() {
     if (memory_ranges.empty()) return;
     
     for (auto& range : memory_ranges) {
-        if (range.second - range.first > 100 * 1024 * 1024) {
-            // Skip huge ranges to avoid scanning forever
-            continue;
-        }
+        if (range.second - range.first > 100 * 1024 * 1024) continue;
         
         for (uintptr_t addr = range.first; addr < range.second - 64; addr += 4) {
             try {
                 float* ptr = (float*)addr;
-                
-                // Check if this could be a coordinate triple
                 if (ptr[0] > -30000.0f && ptr[0] < 30000.0f &&
                     ptr[1] > -256.0f && ptr[1] < 512.0f &&
                     ptr[2] > -30000.0f && ptr[2] < 30000.0f) {
                     
-                    // Look backwards for a string pointer that matches our tile entity types
                     for (int offset = -256; offset <= 0; offset += 8) {
                         uintptr_t* ptr_addr = (uintptr_t*)(addr + offset);
                         uintptr_t potential_string = *ptr_addr;
                         
-                        if (potential_string < range.first || potential_string > range.second + 1000000) {
-                            continue;
-                        }
+                        if (potential_string < range.first || potential_string > range.second + 1000000) continue;
                         
                         try {
                             const char* str = (const char*)potential_string;
-                            
                             for (int i = 0; tile_entity_strings[i]; i++) {
                                 if (strstr(str, tile_entity_strings[i])) {
                                     StorageBlock block;
@@ -201,43 +146,28 @@ void scan_tile_entities() {
                                         float dx = existing.x - block.x;
                                         float dy = existing.y - block.y;
                                         float dz = existing.z - block.z;
-                                        float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-                                        if (dist < 0.5f) {
+                                        if (std::sqrt(dx*dx + dy*dy + dz*dz) < 0.5f) {
                                             is_duplicate = true;
                                             break;
                                         }
                                     }
                                     
-                                    if (!is_duplicate) {
-                                        detected_storage_blocks.push_back(block);
-                                    }
-                                    
+                                    if (!is_duplicate) detected_storage_blocks.push_back(block);
                                     goto next_check;
                                 }
                             }
-                        } catch (...) {
-                            continue;
-                        }
+                        } catch (...) { continue; }
                     }
                 }
-                
                 next_check:
-                if (detected_storage_blocks.size() > 100) {
-                    goto done_scanning;
-                }
-                
-            } catch (...) {
-                continue;
-            }
+                if (detected_storage_blocks.size() > 100) goto done_scanning;
+            } catch (...) { continue; }
         }
     }
-    
     done_scanning:
     scan_count++;
 }
 
-// Simulated World-To-Screen projection framework
-// Note: Real implementations read the target engine's active ViewProjection Matrix.
 bool world_to_screen(float wx, float wy, float wz, ImVec2& out_screen) {
     GLint viewport[4];
     glGetIntegerv(GL_VIEWPORT, viewport);
@@ -246,14 +176,11 @@ bool world_to_screen(float wx, float wy, float wz, ImVec2& out_screen) {
 
     if (screen_width <= 0 || screen_height <= 0) return false;
 
-    // Fallback Mock Projection: Projects onto flat screen center coordinates.
-    // Replace this logic with your targeted matrix calculations as your binary hooking expands.
     out_screen.x = screen_width * 0.5f + (wx * 10.0f); 
     out_screen.y = screen_height * 0.5f - (wy * 10.0f);
     return true;
 }
 
-// OpenGL ES 2.0 Compliant Box Rendering utilizing ImGui draw layers
 void draw_box_3d_imgui(float x, float y, float z, float size, float r, float g, float b, float thickness) {
     float vertices_3d[8][3] = {
         {x - size, y - size, z - size}, {x + size, y - size, z - size},
@@ -264,15 +191,13 @@ void draw_box_3d_imgui(float x, float y, float z, float size, float r, float g, 
     
     ImVec2 screen_points[8];
     for (int i = 0; i < 8; i++) {
-        if (!world_to_screen(vertices_3d[i][0], vertices_3d[i][1], vertices_3d[i][2], screen_points[i])) {
-            return; // Invalidation safe-check
-        }
+        if (!world_to_screen(vertices_3d[i][0], vertices_3d[i][1], vertices_3d[i][2], screen_points[i])) return;
     }
     
     int edges[12][2] = {
-        {0, 1}, {1, 2}, {2, 3}, {3, 0}, // Back
-        {4, 5}, {5, 6}, {6, 7}, {7, 4}, // Front
-        {0, 4}, {1, 5}, {2, 6}, {3, 7}  // Edges
+        {0, 1}, {1, 2}, {2, 3}, {3, 0},
+        {4, 5}, {5, 6}, {6, 7}, {7, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7}
     };
     
     ImDrawList* draw_list = ImGui::GetForegroundDrawList();
@@ -305,9 +230,6 @@ void kairo_init() {
 
     ImGui_ImplOpenGL3_Init("#version 100");
     kairo_initialized = true;
-
-    std::thread* input_thread = new std::thread(input_thread_func);
-    input_thread->detach();
 }
 
 void render_module_item(int idx) {
@@ -351,7 +273,7 @@ void kairo_gui() {
     ImGui::SetNextWindowSize(ImVec2(320, 500), ImGuiCond_FirstUseEver);
 
     if (ImGui::Begin("Kairo", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
-        ImGui::Text("KAIRO");
+        ImGui::Text("KAIRO - Menu Active");
         ImGui::Spacing();
         
         static char search_buf[128] = "";
@@ -374,24 +296,20 @@ void kairo_gui() {
             
             if (ImGui::BeginChild("BlockList", ImVec2(0, 150), true)) {
                 for (auto& block : detected_storage_blocks) {
-                    ImGui::TextWrapped("%s @ (%.0f, %.0f, %.0f)", 
-                        block.type.c_str(), block.x, block.y, block.z);
+                    ImGui::TextWrapped("%s @ (%.0f, %.0f, %.0f)", block.type.c_str(), block.x, block.y, block.z);
                 }
                 ImGui::EndChild();
             }
         }
         
         ImGui::Separator();
-        ImGui::TextDisabled("LClick: Toggle | RClick: Settings");
-        ImGui::TextDisabled("Press O to hide");
+        ImGui::TextDisabled("Press 'O' key to minimize/hide");
     }
     ImGui::End();
 }
 
 void render_esp_boxes() {
     if (!storage_esp_enabled || detected_storage_blocks.empty()) return;
-    
-    // Pass rendering properties directly to our safe ImGui coordinate conversion layer
     for (auto& block : detected_storage_blocks) {
         draw_box_3d_imgui(block.x, block.y, block.z, 0.5f, 
                    esp_outline_color[0], esp_outline_color[1], esp_outline_color[2],
@@ -402,13 +320,6 @@ void render_esp_boxes() {
 EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     if (!kairo_initialized) kairo_init();
     
-    if (o_key_pressed && !o_key_was_pressed) {
-        kairo_visible = !kairo_visible;
-        o_key_was_pressed = true;
-    } else if (!o_key_pressed) {
-        o_key_was_pressed = false;
-    }
-    
     static int frame = 0;
     if (++frame % 2 == 0) {
         scan_tile_entities();
@@ -417,10 +328,15 @@ EGLBoolean hook_eglSwapBuffers(EGLDisplay display, EGLSurface surface) {
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
     
-    // Draw the overlay metrics using current frame calculations safely through ImGui
-    render_esp_boxes();
+    // GUARANTEED INPUT OPTION: Read keypress directly from ImGui's cross-platform IO pipeline
+    // ImGui Key 65 maps to standard keyboard 'O'
+    if (ImGui::IsKeyPressed(ImGuiKey_O)) {
+        kairo_visible = !kairo_visible;
+    }
     
+    render_esp_boxes();
     kairo_gui();
+    
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     
