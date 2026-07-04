@@ -9,16 +9,14 @@ set(SOURCES
     src/main.cpp
 )
 
-# Dear ImGui sources
+# Dear ImGui sources (no Android backend - we handle that ourselves)
 set(IMGUI_DIR imgui)
 set(IMGUI_SOURCES
     ${IMGUI_DIR}/imgui.cpp
-    ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_android.cpp
 )
 
 # Create shared library
